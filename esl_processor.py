@@ -388,6 +388,7 @@ def write_dashboard(
     duplicate_ids: Dict[str, List[str]] = {},
     unmapped_rows: List[dict] = (),
     malformed_records: List[dict] = (),
+    upgraded_records: List[dict] = (),
 ) -> bool:
     """
     写出内部审计汇总表，包含两个 Sheet：
@@ -399,7 +400,8 @@ def write_dashboard(
 
     _write_summary_sheet(wb.create_sheet('Summary'), client_data)
     _write_sanity_check_sheet(
-        wb.create_sheet('Sanity Check'), sheets_data, lost_ids, duplicate_ids, unmapped_rows, malformed_records
+        wb.create_sheet('Sanity Check'), sheets_data, lost_ids, duplicate_ids,
+        unmapped_rows, malformed_records, upgraded_records
     )
 
     try:
@@ -457,6 +459,7 @@ def _write_sanity_check_sheet(
     duplicate_ids: Dict[str, List[str]] = {},
     unmapped_rows: List[dict] = (),
     malformed_records: List[dict] = (),
+    upgraded_records: List[dict] = (),
 ) -> None:
     """
     Sanity Check Sheet（闭环数据对账单）：
@@ -565,16 +568,47 @@ def _write_sanity_check_sheet(
         ok_mal      = ws.cell(row=mal_title_row + 1, column=1, value='（无界形 ID，所有条码均符合 18 位纯数字格式 ✓）')
         ok_mal.font = Font(color='008000')
     else:
-        # 小表头
-        for col_idx, hdr in enumerate(['Client Sheet (客户侧型号表)', 'Invalid ID'], start=1):
+        # 写入小表头（增加工厂原始工作表列）
+        for col_idx, hdr in enumerate(
+            ['Client Sheet (客户侧型号表)', 'Factory Sheet (工厂原始工作表)', 'Invalid ID'], start=1
+        ):
             hdr_cell      = ws.cell(row=mal_title_row + 1, column=col_idx, value=hdr)
             hdr_cell.font = Font(bold=True)
         # 逐行写入
         for i, rec in enumerate(malformed_records, start=mal_title_row + 2):
             ws.cell(row=i, column=1, value=rec['client_sheet'])
-            id_cell               = ws.cell(row=i, column=2, value=rec['invalid_id'])
+            ws.cell(row=i, column=2, value=rec.get('factory_sheets', ''))
+            id_cell               = ws.cell(row=i, column=3, value=rec['invalid_id'])
             id_cell.number_format = '@'
             id_cell.fill          = FILL_ORANGE   # 橙色高亮，与客户报表中保持一致
+
+    # ── 升舱借调明细列表（隔两行开始） ───────────────────────
+    upg_title_row  = ws.max_row + 3
+    upg_title_cell = ws.cell(
+        row=upg_title_row, column=1,
+        value=f'Upgraded Substitutions （库存不足触发的升舱借调明细，共 {len(upgraded_records)} 条）'
+    )
+    upg_title_cell.font = Font(bold=True)
+
+    if not upgraded_records:
+        ok_upg      = ws.cell(row=upg_title_row + 1, column=1,
+                              value='（无升舱借调，所有替换均严格匹配原型号 ✓）')
+        ok_upg.font = Font(color='008000')
+    else:
+        # 写入小表头
+        for col_idx, hdr in enumerate(
+            ['缺货的普通型号', '退回的旧件 ID', '借调的 Pro 型号', '出库的 Pro ID'], start=1
+        ):
+            hdr_cell      = ws.cell(row=upg_title_row + 1, column=col_idx, value=hdr)
+            hdr_cell.font = Font(bold=True)
+        # 逐行写入
+        for i, rec in enumerate(upgraded_records, start=upg_title_row + 2):
+            ws.cell(row=i, column=1, value=rec['original_model'])
+            orig_id_cell               = ws.cell(row=i, column=2, value=rec['found_id'])
+            orig_id_cell.number_format = '@'
+            ws.cell(row=i, column=3, value=rec['upgraded_model'])
+            pro_id_cell               = ws.cell(row=i, column=4, value=rec['upgraded_id'])
+            pro_id_cell.number_format = '@'
 
     _auto_fit_columns(ws)
 
@@ -679,7 +713,8 @@ def main() -> None:
                 df['Model_std'] = df['Model'].apply(normalize_model)
                 sheets_data[sheet] = df
 
-        # ── 畸形 ID 客户侧型号溯源（Step 4 后执行，Model_std 已可用）
+        # ── 畸形 ID 双重视角溯源（Step 4 后执行，Model_std 已可用）
+        # 每次扫码为独立记录，同一异常 ID 出现在多个工厂 Sheet 时分行展示
         malformed_records: List[dict] = []
         if malformed_ids:
             for _sheet in REQUIRED_SHEETS:
@@ -688,8 +723,9 @@ def main() -> None:
                     continue
                 for _, _row in _df[_df['ID'].isin(malformed_ids)].iterrows():
                     malformed_records.append({
-                        'client_sheet': _row['Model_std'],
-                        'invalid_id':   _row['ID'],
+                        'client_sheet':   _row['Model_std'],
+                        'factory_sheets': _sheet,       # 单一工厂 Sheet，不做拼接
+                        'invalid_id':     _row['ID'],
                     })
 
         # ── 全局唯一性审计：以客户标准型号为视角检测重复 ID ───
@@ -733,7 +769,8 @@ def main() -> None:
             })
 
         # ── Step 7：库存分配算法 & 客户报表数据构建 ──────────
-        client_data: Dict[str, List[dict]] = defaultdict(list)
+        client_data: Dict[str, List[dict]]    = defaultdict(list)
+        upgraded_records: List[dict]          = []   # 记录每次升舱借调的明细
 
         for sheet_name, status_code in SHEET_STATUS_MAP.items():
             df = sheets_data[sheet_name]
@@ -762,16 +799,26 @@ def main() -> None:
                 }
 
                 if status_code == 'SWA':
-                    allocated = allocate_from_pool(stock_pool, std_model, '第一轮-严格原配')
+                    allocated       = allocate_from_pool(stock_pool, std_model, '第一轮-严格原配')
+                    _upgrade_used   = None   # 升舱借调使用的目标型号（None 表示未触发）
                     if allocated is None:
                         upgrade_target = UPGRADE_MAP.get(std_model)
                         if upgrade_target:
                             allocated = allocate_from_pool(
                                 stock_pool, upgrade_target, '第二轮-升舱借调'
                             )
+                            if allocated:   # 升舱借调成功，记录目标型号以便后续入表
+                                _upgrade_used = upgrade_target
                     if allocated:
                         entry['swapped_eeg']  = allocated['id']
                         entry['swapped_code'] = std_model
+                        if _upgrade_used:   # 仅升舱路径成功时才记录
+                            upgraded_records.append({
+                                'original_model': std_model,
+                                'found_id':       found_id,
+                                'upgraded_model': _upgrade_used,
+                                'upgraded_id':    allocated['id'],
+                            })
                     else:
                         entry['swapped_eeg']  = 'OUT OF STOCK'
                         entry['swapped_code'] = 'OUT OF STOCK'
@@ -801,20 +848,21 @@ def main() -> None:
 
         # ── Step 10：写出内部审计汇总表 ──────────────────────
         if not write_dashboard(client_data, sheets_data, lost_ids, str(dashboard_path),
-                               duplicate_ids, unmapped_rows, malformed_records):
+                               duplicate_ids, unmapped_rows, malformed_records, upgraded_records):
             print(f'[SKIPPED] 处理失败被跳过: {stem} | 原因: Dashboard 写入失败（请关闭占用的 Excel 文件后重新运行）')
             count_skipped += 1
             continue
 
         # ── 三分支心跳日志（每文件唯一输出行）────────────────
         has_anomaly = (
-            len(lost_ids)      > 0 or
-            len(malformed_ids) > 0 or
-            len(duplicate_ids) > 0 or
-            len(unmapped_rows) > 0
+            len(lost_ids)         > 0 or
+            len(malformed_ids)    > 0 or
+            len(duplicate_ids)    > 0 or
+            len(unmapped_rows)    > 0 or
+            len(upgraded_records) > 0
         )
         if has_anomaly:
-            print(f'[WARNING] 数据异常警报: 文件 "{stem}" 存在业务瑕疵 (畸形/失踪/冲突/未映射)，请前往其对应的 dashboard.xlsx 审查明细！')
+            print(f'[WARNING] 数据异常警报: 文件 "{stem}" 存在业务瑕疵 (界形/失踪/冲突/未映射/升舱借调)，请前往其对应的 dashboard.xlsx 审查明细！')
             count_warning += 1
         else:
             print(f'[SUCCESS] 完美处理: {stem}')
