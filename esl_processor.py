@@ -146,7 +146,11 @@ def normalize_model(raw: str) -> str:
             return 'Polaris Pro-160SQ'
         if '230SQ' in su:
             return 'Polaris Pro-230SQ'
+        if '230S-Q' in su:
+            return 'Polaris Pro-230SQ'
         if '230SF' in su:
+            return 'Polaris Pro-230SF'
+        if '230S-F' in su:
             return 'Polaris Pro-230SF'
         if '420' in su:
             return 'Polaris Pro-420Q'
